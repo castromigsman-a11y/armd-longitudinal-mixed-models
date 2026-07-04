@@ -1,0 +1,105 @@
+---
+title: "Longitudinal Analysis of the ARMD Trial"
+author: "Miguel Castro"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center")
+library(nlmeU)
+library(nlme)
+library(lattice)
+```
+
+## Data
+
+Build a random 150-patient subsample of the ARMD trial and keep the long (post-baseline)
+format.
+
+```{r data}
+set.seed(43)
+idx <- sample(1:240, 150)
+data(armd.wide)
+data(armd)
+sel <- levels(armd.wide$subject)[idx]
+armd.wide.s <- droplevels(armd.wide[armd.wide$subject %in% sel, ])
+armd.s      <- droplevels(armd[armd$subject %in% sel, ])  # long format, post-baseline only
+```
+
+Quick description and the missing-data pattern (dropout is mostly monotone and at the end of
+follow-up; treated as MAR, models fitted by ML).
+
+```{r describe}
+dim(armd.wide.s)
+table(armd.wide.s$treat.f)
+table(armd.wide.s$miss.pat)
+```
+
+Mean and sd of visual acuity by visit and arm — note the sd grows over time (non-constant
+variance).
+
+```{r means}
+with(armd.s, round(tapply(visual, list(time.f, treat.f), mean, na.rm = TRUE), 2))
+with(armd.s, round(tapply(visual, list(time.f, treat.f), sd,   na.rm = TRUE), 2))
+```
+
+## Marginal models (gls)
+
+Same mean structure as the ARMD case study: baseline as a covariate, a mean per visit, and a
+treatment-by-visit interaction. Fit homoscedastic, then add a power-of-time variance and
+within-subject correlation structures, comparing by likelihood-ratio tests.
+
+```{r gls}
+lm1.form <- formula(visual ~ -1 + visual0 + time.f + time.f:treat.f)
+
+fm6.1 <- gls(lm1.form, data = armd.s)                                    # homoscedastic
+fm9.2 <- gls(lm1.form, weights = varPower(form = ~time), data = armd.s)  # power-of-time variance
+anova(fm6.1, fm9.2)
+
+# add within-subject correlation: compound symmetry, then general/unstructured
+fm12.1 <- gls(lm1.form, weights = varPower(form = ~time),
+              correlation = corCompSymm(form = ~tp | subject), data = armd.s)
+fm12.3 <- gls(lm1.form, weights = varPower(form = ~time),
+              correlation = corSymm(form = ~tp | subject), data = armd.s)
+anova(fm9.2, fm12.1, fm12.3)
+intervals(fm12.3, which = "var-cov")$corStruct   # closer visits correlate more
+```
+
+## Mixed models (lme)
+
+Attribute the within-subject correlation to subject-level random effects: random intercept,
+then intercept + slope, with a power variance on the residuals.
+
+```{r lme}
+fm16.1 <- lme(lm1.form, random = ~1 | subject, data = armd.s)   # random intercept (ICC ~ 0.50)
+VarCorr(fm16.1)
+
+fm16.2 <- lme(lm1.form, random = ~1 | subject,
+              weights = varPower(form = ~time), data = armd.s)   # + power variance
+anova(fm16.1, fm16.2)
+
+fm16.3 <- lme(lm1.form, random = ~1 + time | subject,           # + random slope (final model)
+              weights = varPower(form = ~time), data = armd.s,
+              control = lmeControl(opt = "optim", maxIter = 200, msMaxIter = 200))
+anova(fm16.2, fm16.3)
+summary(fm16.3)
+```
+
+## Treatment effect
+
+The treatment effect is spread over four interaction terms, so test it jointly: refit by ML
+and compare against a model with no treatment terms via a likelihood-ratio test.
+
+```{r treatment}
+fm.full <- update(fm16.3, method = "ML")
+fm.red  <- update(fm.full, fixed = visual ~ -1 + visual0 + time.f)
+anova(fm.red, fm.full)   # LR = 4.33, df = 4, p = 0.36 -> no significant treatment effect
+```
+
+## Diagnostics
+
+```{r diagnostics}
+plot(fm16.3, resid(., type = "pearson") ~ fitted(.) | time.f, abline = 0)
+qqnorm(fm16.3, ~resid(., type = "pearson"))
+qqnorm(fm16.3, ~ranef(.))
+```
